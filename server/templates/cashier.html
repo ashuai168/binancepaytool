@@ -302,7 +302,9 @@ function claim(){var v=document.getElementById("claimInput").value.replace(/\s+/
  .then(function(r){return r.json()}).then(function(d){
    var c=(d.data&&d.data.code)||d.code;
    if(c==="OK"){msg.textContent="核验成功，订单已支付 ✓";msg.className="good";poll()}
-   else if(c==="UNDERPAID"){msg.textContent="已到账但金额不足，请联系商家";msg.className="bad";poll()}
+   else if(c==="UNDERPAID"){msg.textContent="这笔转账金额不足，订单仍可付款。请联系商家核对，勿重复支付";msg.className="bad";poll()}
+   else if(c==="MISMATCH"){msg.textContent="这笔转账无法与本订单匹配，请联系商家核对，勿重复支付";msg.className="bad"}
+   else if(c==="TIME_WINDOW"){msg.textContent="转账时间不在本订单付款范围内，请联系商家核对，勿重复支付";msg.className="bad"}
    else if(c==="NOT_FOUND"){msg.textContent="未找到这笔入账，请确认编号无误、稍等片刻再试";msg.className="bad"}
    else if(c==="CONSUMED"){msg.textContent="该笔转账已被使用";msg.className="bad"}
    else if(c==="CURRENCY"){msg.textContent="这笔转账的币种与订单不符，请联系商家";msg.className="bad"}

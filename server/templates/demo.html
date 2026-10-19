@@ -65,7 +65,7 @@ code{background:rgba(127,127,127,.15);padding:1px 5px;border-radius:4px;font-siz
     <ul>
       <li><b>唯一金额</b>：每单分配唯一尾数，付款金额即订单指纹，零动作自动确认</li>
       <li><b>备注码</b>：金额不精确也行，备注带上 6 位码即可确认</li>
-      <li><b>回填订单编号</b>：什么都没带？付完粘贴币安订单编号，秒级核验</li>
+      <li><b>回填订单编号</b>：已按页面金额或备注付款？粘贴币安订单编号核验</li>
     </ul>
     <div class="muted" style="margin-top:8px">付完款后收银页几秒内自动变绿，这就是网关在用币安官方只读接口对账。</div>
   </div>
@@ -84,7 +84,7 @@ code{background:rgba(127,127,127,.15);padding:1px 5px;border-radius:4px;font-siz
         <div class="modes" style="margin-top:10px">
           <label class="mode on"><input type="radio" name="mode" value="amount" checked><div><b>唯一金额（默认，生产流程）</b><span>按收银页金额一分不差支付，备注可选，付完自动确认；一直没到可回填订单编号兜底</span></div></label>
           <label class="mode"><input type="radio" name="mode" value="note"><div><b>备注码</b><span>金额 ≥ 基础金额即可，备注必须填 6 位码，靠备注确认</span></div></label>
-          <label class="mode"><input type="radio" name="mode" value="claim"><div><b>回填订单编号</b><span>付基础金额、不填备注，付完在收银页粘贴币安订单编号核验</span></div></label>
+          <label class="mode"><input type="radio" name="mode" value="claim"><div><b>回填订单编号</b><span>按页面唯一金额付款，备注可不填，付完粘贴币安订单编号核验，也可能先自动确认</span></div></label>
         </div>
       </details>
       {{if .Error}}<div class="err">{{.Error}}</div>{{end}}

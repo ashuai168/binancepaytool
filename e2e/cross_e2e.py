@@ -120,7 +120,7 @@ DB_PATH={tempfile.mkdtemp()}/e2e.db
         assert got2["order_id"] == order["order_id"]
         print("① 金额匹配 + 回调验签 ... PASS")
 
-        # ② 回填 claim
+        # ② 无绑定回填必须拒绝，并保留订单正常付款的机会
         order2 = gw.create_order("E2E-2", "33", currency="USDT", callback_url=cb_url)
         TXNS.append({"orderId": "452100000000000002", "note": "", "orderType": "C2C",
                      "transactionId": "P_E2E000002", "transactionTime": int(time.time() * 1000),
@@ -131,11 +131,24 @@ DB_PATH={tempfile.mkdtemp()}/e2e.db
                                      data=json.dumps({"binance_order_id": "452100000000000002"}).encode(),
                                      headers={"Content-Type": "application/json"}, method="POST")
         out = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        assert out["data"]["code"] == "MISMATCH" and out["data"]["status"] == "pending", out
+        assert gw.get_order(order2["order_id"])["status"] == "pending"
+
+        # 按唯一金额付款后仍可回填；也可能由并行轮询先自动确认
+        TXNS.append({"orderId": "452100000000000003", "note": "", "orderType": "C2C",
+                     "transactionId": "P_E2E000003", "transactionTime": int(time.time() * 1000),
+                     "amount": order2["pay_amount"], "currency": "USDT",
+                     "counterpartyId": 1163000000, "payerInfo": {"name": "e2e-payer"}})
+        req = urllib.request.Request(base + f"/pay/{token}/claim",
+                                     data=json.dumps({"binance_order_id": "452100000000000003"}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        out = json.loads(urllib.request.urlopen(req, timeout=10).read())
         assert out["data"]["code"] == "OK" and out["data"]["status"] == "paid", out
         headers, body = CB_QUEUE.get(timeout=15)
         payload = BPayGate.verify_callback(headers, body, SECRET)
-        assert payload["event"] == "paid" and payload["matched_by"] == "claim", payload
-        print("② 回填核验 + 回调验签 ... PASS")
+        assert payload["event"] == "paid" and payload["matched_by"] in ("claim", "amount"), payload
+        assert payload["binance_order_id"] == "452100000000000003", payload
+        print("② 无绑定回填拒绝 + 正常付款/回填 + 回调验签 ... PASS")
 
         # ③ 收银页可渲染
         html = urllib.request.urlopen(base + "/pay/" + token, timeout=5).read().decode()

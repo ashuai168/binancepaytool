@@ -42,11 +42,11 @@ func (a *App) handleCashier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hasQR := acc.ReceiveLink != "" || (o.AccountID == defaultAccountID && (a.cfg.QRImage != "" || a.qrPNG != nil))
-	// mode 仅用于体验站引导：note/claim 模式下引导付基础金额，让另外两种匹配方式有机会命中
+	// note 模式可付基础金额并带备注；claim 仍展示唯一金额，避免无绑定付款。
 	mode := demoMode(r.URL.Query().Get("mode"))
 	showAmount := fmtAmount(o.PayAmount)
 	amountHead, amountTailStr := amountTail(o.PayAmount, o.BaseAmount)
-	if mode != "amount" {
+	if mode == "note" {
 		showAmount = fmtAmount(o.BaseAmount)
 		amountHead, amountTailStr = showAmount, ""
 	}

@@ -137,7 +137,7 @@ func TestTrustProxyClientIP(t *testing.T) {
 	}
 }
 
-// 体验站三种到账确认方式的引导：note/claim 模式显示基础金额并调整备注文案，claim 模式回填区默认展开
+// note 模式显示基础金额；claim 保留唯一金额并默认展开回填区。
 func TestDemoConfirmModes(t *testing.T) {
 	e := newDemoEnv(t)
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -162,8 +162,8 @@ func TestDemoConfirmModes(t *testing.T) {
 		t.Fatal("note 模式应显示基础金额与备注必填")
 	}
 	h = get("claim")
-	if !strings.Contains(h, "0.5<small>") || !strings.Contains(h, "<details open>") || !strings.Contains(h, "不要填备注") {
-		t.Fatal("claim 模式应显示基础金额、不填备注、回填区展开")
+	if strings.Contains(h, "0.5<small>") || !strings.Contains(h, `class="tail"`) || !strings.Contains(h, "<details open>") || !strings.Contains(h, "不要填备注") {
+		t.Fatal("claim 模式应显示唯一金额、不填备注、回填区展开")
 	}
 	if get("bogus") == "" || demoMode("bogus") != "amount" {
 		t.Fatal("非法 mode 应回落到 amount")

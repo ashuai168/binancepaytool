@@ -82,6 +82,10 @@ type env struct {
 }
 
 func newEnv(t *testing.T) *env {
+	return newEnvWithWorkers(t, true)
+}
+
+func newEnvWithWorkers(t *testing.T, workers bool) *env {
 	mock := newMockBinance()
 	cfg := &Config{
 		Listen: "127.0.0.1:0", BaseURL: "http://gw.test", APIAuthKey: testSecret,
@@ -98,8 +102,10 @@ func newEnv(t *testing.T) *env {
 	}
 	srv := httptest.NewServer(app.mux)
 	ctx, cancel := context.WithCancel(context.Background())
-	go app.matcher.run(ctx)
-	go app.notifier.run(ctx)
+	if workers {
+		go app.matcher.run(ctx)
+		go app.notifier.run(ctx)
+	}
 	ch := make(chan cbRecv, 16)
 	cbS := newCallbackServer(ch)
 	e := &env{t: t, app: app, srv: srv, mock: mock, cbCh: ch, cbS: cbS}
@@ -254,30 +260,12 @@ func TestNoteMatchFlow(t *testing.T) {
 	}
 }
 
-// ②b 备注命中但实付不足 → underpaid
-func TestUnderpaidViaNote(t *testing.T) {
-	e := newEnv(t)
-	d := e.create("M-under-1", "USDT", "30", e.cbS.URL)
-	code := d["note_code"].(string)
-	e.mock.inject(mkTxn(nextBinanceOrderID(), "29", "USDT", code))
-	got := e.waitStatus(d["order_id"].(string), "underpaid", 10*time.Second)
-	if got["actual_amount"] != "29" {
-		t.Fatalf("underpaid 信息错误: %v", got)
-	}
-	cb := e.waitCallback(10 * time.Second)
-	var payload map[string]any
-	json.Unmarshal(cb.body, &payload)
-	if payload["event"] != "underpaid" {
-		t.Fatalf("回调事件应为 underpaid: %v", payload)
-	}
-}
-
 // ③ 收银页回填币安订单编号
 func TestClaimFlow(t *testing.T) {
-	e := newEnv(t)
+	e := newEnvWithWorkers(t, false)
 	d := e.create("M-claim-1", "USDT", "40", e.cbS.URL)
 	bid := nextBinanceOrderID()
-	e.mock.inject(mkTxn(bid, "40", "USDT", "")) // 金额=基础值且无备注 → 自动路径不命中
+	e.mock.inject(mkTxn(bid, d["pay_amount"].(string), "USDT", ""))
 	payURL := d["pay_url"].(string)
 	token := payURL[len("http://gw.test/pay/"):]
 	body, _ := json.Marshal(map[string]string{"binance_order_id": bid})
@@ -481,11 +469,11 @@ func TestMultiAccount(t *testing.T) {
 	if _, out := e.doSigned("GET", "/api/v1/accounts/"+accID, nil); out["data"].(map[string]any)["last_ok"].(float64) <= 0 {
 		t.Fatalf("轮询成功后 last_ok 应更新: %v", out)
 	}
-	// 回填：子账号第二单，金额=基础值无备注 → 收银页回填订单编号 → 在子账号流水里找到
+	// 回填：子账号第二单，唯一金额绑定 → 在子账号流水里找到
 	code, out = post("/api/v1/orders", map[string]any{"merchant_order_id": "M-acc-2", "currency": "USDT", "amount": "9", "account_id": accID})
 	d2 := out["data"].(map[string]any)
 	bid2 := nextBinanceOrderID()
-	e.mock.injectFor(k2, mkTxn(bid2, "9", "USDT", ""))
+	e.mock.injectFor(k2, mkTxn(bid2, d2["pay_amount"].(string), "USDT", ""))
 	tok2 := d2["pay_url"].(string)[len("http://gw.test/pay/"):]
 	cbody, _ := json.Marshal(map[string]string{"binance_order_id": bid2})
 	resp, err = http.Post(e.srv.URL+"/pay/"+tok2+"/claim", "application/json", bytes.NewReader(cbody))

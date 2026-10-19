@@ -188,7 +188,7 @@ func (m *Matcher) scan(as *accountState) (bool, error) {
 			minCreated = o.CreatedAt
 		}
 	}
-	txns, err := m.fetchWindow(as, minCreated-10*60*1000)
+	txns, err := m.fetchWindow(as, minCreated)
 	if err != nil {
 		return true, err
 	}
@@ -219,6 +219,50 @@ func payerOf(t payTxn) string {
 	return strconv64(t.CounterpartyID)
 }
 
+const claimMaxAgeMs = int64(7 * 24 * 60 * 60 * 1000)
+
+// validPaymentTime is checked even for cached transactions: a Binance order ID
+// must not turn a payment from before this order into evidence for a new one.
+// Allow a small forward clock skew between this server and Binance, never a
+// transaction before order creation or at/after the end of its payment window.
+func (m *Matcher) validPaymentTime(o *Order, t payTxn, now int64) bool {
+	return t.Time > 0 && t.Time >= o.CreatedAt &&
+		t.Time < o.ExpiresAt+m.cfg.ExpiredGrace*1000 && t.Time <= now+120*1000
+}
+
+// resolvePayment gives polling and public claims the same binding rules and
+// priority. A claim cannot take an amount assigned to another order, even by
+// supplying its own note. Ambiguous amounts or notes require merchant review.
+func (m *Matcher) resolvePayment(cands []*Order, t payTxn, amt, now int64) (*Order, string) {
+	cur := strings.ToUpper(t.Currency)
+	var amountMatch, noteMatch *Order
+	amountCount, noteCount := 0, 0
+	note := strings.ToUpper(t.Note)
+	for _, o := range cands {
+		if o.Currency != cur || !m.validPaymentTime(o, t, now) {
+			continue
+		}
+		if o.PayAmount == amt {
+			amountMatch = o
+			amountCount++
+		}
+		if o.NoteCode != "" && strings.Contains(note, o.NoteCode) {
+			noteMatch = o
+			noteCount++
+		}
+	}
+	if amountCount == 1 {
+		return amountMatch, "amount"
+	}
+	if amountCount > 1 {
+		return nil, ""
+	}
+	if noteCount == 1 {
+		return noteMatch, "note"
+	}
+	return nil, ""
+}
+
 // applyTxn 尝试用一笔流水核销该账号的订单（规则 ①②）。
 func (m *Matcher) applyTxn(as *accountState, t payTxn) error {
 	amt, err := parseAmount(t.Amount)
@@ -240,42 +284,35 @@ func (m *Matcher) applyTxn(as *accountState, t payTxn) error {
 	if err != nil {
 		return err
 	}
-	payerID := payerOf(t)
-	// ① 唯一金额精确匹配
-	for _, o := range cands {
-		if o.Currency == cur && o.PayAmount == amt && t.Time >= o.CreatedAt-120*1000 {
-			ok, err := m.st.Finish(o, "paid", "amount", t.OrderID, t.TransactionID, payerID, t.PayerInfo.Name, idStr(t.PayerInfo.BinanceID), idStr(t.CounterpartyID), amt, m.cfg.SuffixCooldown)
-			if ok {
-				log.Printf("[info] 订单 %s 已支付（金额匹配）account=%s binanceOrderId=%s amount=%s %s", o.ID, as.acc.ID, t.OrderID, fmtAmount(amt), cur)
-			}
-			return err
-		}
-	}
-	// ② 备注含 note_code
-	note := strings.ToUpper(t.Note)
-	if note == "" {
+	o, matchedBy := m.resolvePayment(cands, t, amt, now)
+	if o == nil || (matchedBy == "note" && amt < o.BaseAmount) {
+		// A small note-bound payment must not lock the order in a terminal
+		// underpaid state. Leave it payable, without consuming this transaction.
 		return nil
 	}
-	for _, o := range cands {
-		if o.Currency != cur || !strings.Contains(note, o.NoteCode) {
-			continue
-		}
-		status := "paid"
-		if amt < o.BaseAmount {
-			status = "underpaid"
-		}
-		ok, err := m.st.Finish(o, status, "note", t.OrderID, t.TransactionID, payerID, t.PayerInfo.Name, idStr(t.PayerInfo.BinanceID), idStr(t.CounterpartyID), amt, m.cfg.SuffixCooldown)
-		if ok {
-			log.Printf("[info] 订单 %s → %s（备注匹配）account=%s binanceOrderId=%s amount=%s %s", o.ID, status, as.acc.ID, t.OrderID, fmtAmount(amt), cur)
-		}
-		return err
+	ok, err := m.st.Finish(o, "paid", matchedBy, t.OrderID, t.TransactionID, payerOf(t), t.PayerInfo.Name, idStr(t.PayerInfo.BinanceID), idStr(t.CounterpartyID), amt, m.cfg.SuffixCooldown)
+	if ok {
+		log.Printf("[info] 订单 %s 已支付（%s 匹配）account=%s binanceOrderId=%s amount=%s %s", o.ID, matchedBy, as.acc.ID, t.OrderID, fmtAmount(amt), cur)
 	}
-	return nil
+	return err
 }
 
 type claimResult struct {
-	Code   string // OK / NOT_FOUND / CONSUMED / CURRENCY / UNDERPAID / STATE
+	Code   string // OK / NOT_FOUND / CONSUMED / CURRENCY / UNDERPAID / MISMATCH / TIME_WINDOW / STATE
 	Status string // 处理后订单状态
+}
+
+// A poll can finish the same payment while a claim is in flight. Report the
+// already-completed payment as success rather than a misleading CONSUMED error.
+func (m *Matcher) currentClaimResult(o *Order, binanceOrderID, code string) (claimResult, error) {
+	current, err := m.st.OrderByID(o.ID)
+	if err != nil {
+		return claimResult{}, err
+	}
+	if current.Status == "paid" && current.BinanceOrderID == binanceOrderID {
+		return claimResult{Code: "OK", Status: "paid"}, nil
+	}
+	return claimResult{Code: code, Status: current.Status}, nil
 }
 
 // Claim 处理收银页回填的币安订单编号（规则 ③），只在订单所属账号的流水里找。
@@ -283,13 +320,14 @@ func (m *Matcher) Claim(o *Order, binanceOrderID string) (claimResult, error) {
 	if o.Status == "paid" {
 		return claimResult{Code: "OK", Status: "paid"}, nil
 	}
-	if o.Status != "pending" && o.Status != "expired" {
+	now := nowMs()
+	if (o.Status != "pending" && o.Status != "expired") || now >= o.CreatedAt+claimMaxAgeMs {
 		return claimResult{Code: "STATE", Status: o.Status}, nil
 	}
 	if done, err := m.st.Consumed(binanceOrderID); err != nil {
 		return claimResult{}, err
 	} else if done {
-		return claimResult{Code: "CONSUMED", Status: o.Status}, nil
+		return m.currentClaimResult(o, binanceOrderID, "CONSUMED")
 	}
 	as := m.stateFor(o.AccountID)
 	if as == nil {
@@ -308,7 +346,7 @@ func (m *Matcher) Claim(o *Order, binanceOrderID string) (claimResult, error) {
 	hit := find(as.cache)
 	m.mu.Unlock()
 	if hit == nil {
-		fresh, err := m.fetchWindow(as, o.CreatedAt-10*60*1000)
+		fresh, err := m.fetchWindow(as, o.CreatedAt)
 		if err != nil {
 			return claimResult{}, err
 		}
@@ -328,19 +366,35 @@ func (m *Matcher) Claim(o *Order, binanceOrderID string) (claimResult, error) {
 	if strings.ToUpper(t.Currency) != o.Currency {
 		return claimResult{Code: "CURRENCY", Status: o.Status}, nil
 	}
-	status, code := "paid", "OK"
-	if amt < o.BaseAmount {
-		status, code = "underpaid", "UNDERPAID"
+	now = nowMs()
+	if now >= o.CreatedAt+claimMaxAgeMs {
+		return claimResult{Code: "STATE", Status: o.Status}, nil
 	}
-	ok, err := m.st.Finish(o, status, "claim", t.OrderID, t.TransactionID, payerOf(t), t.PayerInfo.Name, idStr(t.PayerInfo.BinanceID), idStr(t.CounterpartyID), amt, m.cfg.SuffixCooldown)
+	if !m.validPaymentTime(o, t, now) {
+		return claimResult{Code: "TIME_WINDOW", Status: o.Status}, nil
+	}
+	// Resolve against every order whose payment window covers this transaction,
+	// including on-time payments being recovered after the automatic grace period.
+	cands, err := m.st.CandidateOrders(o.AccountID, t.Time, m.cfg.ExpiredGrace*1000)
+	if err != nil {
+		return claimResult{}, err
+	}
+	bound, matchedBy := m.resolvePayment(cands, t, amt, now)
+	if bound == nil || bound.ID != o.ID {
+		return m.currentClaimResult(o, binanceOrderID, "MISMATCH")
+	}
+	if matchedBy == "note" && amt < o.BaseAmount {
+		return claimResult{Code: "UNDERPAID", Status: o.Status}, nil
+	}
+	ok, err := m.st.Finish(o, "paid", "claim", t.OrderID, t.TransactionID, payerOf(t), t.PayerInfo.Name, idStr(t.PayerInfo.BinanceID), idStr(t.CounterpartyID), amt, m.cfg.SuffixCooldown)
 	if err != nil {
 		return claimResult{}, err
 	}
 	if !ok {
-		return claimResult{Code: "CONSUMED", Status: o.Status}, nil
+		return m.currentClaimResult(o, binanceOrderID, "CONSUMED")
 	}
-	log.Printf("[info] 订单 %s → %s（回填匹配）account=%s binanceOrderId=%s", o.ID, status, o.AccountID, t.OrderID)
-	return claimResult{Code: code, Status: status}, nil
+	log.Printf("[info] 订单 %s → paid（回填匹配）account=%s binanceOrderId=%s", o.ID, o.AccountID, t.OrderID)
+	return claimResult{Code: "OK", Status: "paid"}, nil
 }
 
 func strconv64(v int64) string {
